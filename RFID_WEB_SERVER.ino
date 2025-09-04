@@ -1,17 +1,17 @@
 /*
- * ESP32 RFID + 8 Relay + ESP RainMaker (v2.2.0 - Hybrid Sync with timestamps)
+ * ESP32 RFID + 8 Relay + ESP RainMaker (v2.3.0 - Full)
  *
- * Perubahan utama v2.2.0:
- * - Tambah field updatedAt (timestamp) pada setiap kartu untuk menyelesaikan konflik offline/online.
- * - Saat Add/Remove lokal di ESP32, updatedAt diset ke waktu sekarang (format YYYY-MM-DD HH:MM:SS).
- * - Saat sync dengan server: bandingkan updatedAt; versi terbaru dipakai.
- * - Jika ESP32 memiliki versi lebih baru, push ke server; jika server lebih baru, overwrite lokal.
+ * Penambahan utama:
+ * - Device baru "Config_Server" (ServerURL & APIKey editable via RainMaker)
+ * - ServerURL & APIKey disimpan di NVS (Preferences) sehingga tidak perlu re-flash
  *
- * Pastikan server API menerima/menyajikan updated_at:
- * - add_card.php expects uid, mask, updated_at (optional)
- * - remove_card.php expects uid, updated_at (optional)
- * - sync.php returns cards as [{uid, mask, updated_at}, ...]
- * - log_access.php accepts uid, action, relays
+ * Semua fitur v2.2.0 dipertahankan:
+ * - NVS kartu (save/load)
+ * - timestamp updatedAt pada kartu
+ * - hybrid sync (sync.php, add_card.php, remove_card.php, log_access.php)
+ * - relay mask per kartu
+ * - uraian RainMaker: RFID_Controller + Relay_Controller
+ * - buzzer, provisioning, OTA, schedule
  */
 
 #include <Arduino.h>
@@ -32,23 +32,29 @@
 #define RST_PIN        22   // MFRC522 RST
 #define BUZZER_PIN     15   // Buzzer aktif HIGH
 
-// 8 pin relay
+// 8 pin relay (sesuai kode awal)
 const int RELAY_PINS[8] = {21, 12, 25, 26, 13, 14, 33, 32};
 #define RELAY_ACTIVE_HIGH  false  // ubah ke false jika relay board aktif LOW
 
 // =================== RFID ===================
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
-// =================== NVS ===================
+// =================== NVS / Preferences ===================
 Preferences prefs;
-const char *NVS_NS = "rfid";
-const char *NVS_KEY_COUNT = "count";  // uint16_t
+const char *NVS_NS = "rfid";  // sudah dipakai untuk kartu
+const char *NVS_KEY_COUNT = "count";  // uint16_t untuk jumlah yang disimpan
 #define MAX_CARDS 64
 
+// NVS untuk config server (baru)
+const char *NVS_NS_CONFIG = "config";
+const char *NVS_KEY_URL   = "serverURL";
+const char *NVS_KEY_API   = "apiKey";
+
+// =================== Data Structure ===================
 struct CardEntry {
   String uid;
   uint8_t mask;
-  String updatedAt;  // format: YYYY-MM-DD HH:MM:SS (ISO-like)
+  String updatedAt;  // format: YYYY-MM-DD HH:MM:SS
 };
 #include <vector>
 std::vector<CardEntry> cards;
@@ -56,10 +62,11 @@ std::vector<CardEntry> cards;
 // =================== RainMaker ===================
 static Node my_node;
 static Device rfid_dev("RFID_Controller");   // Device utama
-static Device relay_dev("Relay_Controller"); // Device baru
-static uint8_t wifiLed = 2;  //D2
+static Device relay_dev("Relay_Controller"); // Device relay
+static Device config_dev("Config_Server");   // Device baru untuk config
+static uint8_t wifiLed = 2;  //D2 (jika ada LED wifi)
 
-// Nama parameter
+// Nama parameter (sama seperti versi awal)
 const char *P_STATUS      = "Status";
 const char *P_ADD_MODE    = "AddMode";
 const char *P_REMOVE_MODE = "RemoveMode";
@@ -83,9 +90,11 @@ uint32_t modeStartMs = 0;
 const char *service_name = "Prov_ESP32";
 const char *pop = "abcd1234";
 
-// =================== HYBRID Server Config ===================
-String serverURL = "http://192.168.1.13:8080/akseskontrol2/"; // ganti dgn alamat server Anda, akhiri '/'
-String apiKey     = "mysecret123";                      // isi sesuai server (optional)
+// =================== HYBRID Server Config (default values) ===================
+// Default pertama kali flash — setelah itu akan dibaca dari NVS (Preferences)
+String serverURL = "http://192.168.1.13:8080/akseskontrol2/"; // ganti jika perlu
+String apiKey     = "mysecret123";                            // isi sesuai server (optional)
+
 unsigned long lastSync = 0;
 const unsigned long syncInterval = 300000;    // 5 menit
 
@@ -106,8 +115,7 @@ void buzzer_timeout3() { buzzOnce(60); delay(80); buzzOnce(60); delay(80); buzzO
 String formatTimeNow() {
   time_t now = time(nullptr);
   if (now < 1600000000) {
-    // Kalau NTP belum sync, fallback ke millis() unik (tapi string tidak berguna untuk compare)
-    // Sebaiknya pastikan RMaker/ntp sudah men-set waktu.
+    // Kalau NTP belum sync, fallback ke millis()
     char buf[32];
     snprintf(buf, sizeof(buf), "1970-01-01 %010lu", millis() / 1000);
     return String(buf);
@@ -171,7 +179,7 @@ String maskToList(uint8_t m) {
 
 String buildListCardsText() {
   String s;
-  for (size_t i=0;i<cards.size(); i++) {
+  for (size_t i=0; i<cards.size(); i++) {
     s += cards[i].uid;
     s += "  [";
     s += maskToList(cards[i].mask);
@@ -198,7 +206,7 @@ void updateLastAccessParam(const String &uid, bool granted, uint8_t mask) {
   rfid_dev.updateAndReportParam(P_LASTACCESS, (char*)s.c_str());
 }
 
-// =================== NVS Save/Load ===================
+// =================== NVS Save/Load Kartu ===================
 void saveCardsToNVS() {
   prefs.begin(NVS_NS, false);
   uint16_t prev = prefs.getUShort(NVS_KEY_COUNT, 0);
@@ -285,7 +293,6 @@ void addCardToLocal(const String &uid, uint8_t mask, bool pushServer = true) {
   } else if ((int)cards.size() < MAX_CARDS) {
     cards.push_back({uid, mask, now});
   } else {
-    // jika penuh, skip (atau Anda bisa implement queue)
     Serial.println("[NVS] max cards reached, cannot add");
     return;
   }
@@ -293,7 +300,6 @@ void addCardToLocal(const String &uid, uint8_t mask, bool pushServer = true) {
   updateListCardsParam();
 
   if (pushServer && WiFi.status() == WL_CONNECTED) {
-    // push to server with updated_at
     HTTPClient http;
     http.setTimeout(5000);
     http.begin(serverURL + "add_card.php");
@@ -385,7 +391,6 @@ void syncCardsFromServer() {
     String payload = http.getString();
     Serial.println(String("[SYNC] payload size: ") + payload.length());
     // parse JSON
-    // allocate doc — size depends on expected number of cards
     const size_t CAP = 16384;
     DynamicJsonDocument doc(CAP);
     DeserializationError err = deserializeJson(doc, payload);
@@ -402,8 +407,6 @@ void syncCardsFromServer() {
     }
     JsonArray arr = doc["cards"].as<JsonArray>();
 
-    // Build a map of server cards for quick lookup (we will iterate server side)
-    // For each server card, compare with local by uid
     for (JsonObject obj : arr) {
       String uid = obj["uid"].as<String>();
       uint8_t mask = (uint8_t)(obj["mask"].as<int>());
@@ -433,17 +436,11 @@ void syncCardsFromServer() {
       }
     }
 
-    // Nota bene: server mungkin memiliki kartu yang telah dihapus, but local still has it.
-    // To handle deletions from server: we will check local cards that are not present in server list.
-    // Build a set of server UIDs to detect deletions.
+    // Build serverUIDs (unused for deletion auto-removal in this implementation)
     std::vector<String> serverUIDs;
     for (JsonObject obj : arr) {
       serverUIDs.push_back(obj["uid"].as<String>());
     }
-    // remove local cards that are not in server only if server's updated_at indicates a deletion? 
-    // For safety, we will NOT auto-delete local-only cards to avoid losing offline adds.
-    // Instead: if admin wants deletion, they should call remove_card.php which will be pushed to ESP32 via sync with empty/marker.
-    // (Optional improvement: implement tombstones.)
 
     // Save local changes
     saveCardsToNVS();
@@ -457,6 +454,7 @@ void syncCardsFromServer() {
 }
 
 // =================== RainMaker Callbacks ===================
+// sysProvEvent (provisioning events)
 void sysProvEvent(arduino_event_t *sys_event) {
   switch (sys_event->event_id) {
     case ARDUINO_EVENT_PROV_START:
@@ -481,10 +479,32 @@ void sysProvEvent(arduino_event_t *sys_event) {
   }
 }
 
-
 void write_callback(Device *device, Param *param, const param_val_t val, void *priv, write_ctx_t *ctx)
 {
   const char *pname = param->getParamName();
+  const char *dname = device->getDeviceName();
+
+  // === NEW: Config_Server handling ===
+  if (!strcmp(dname, "Config_Server")) {
+    if (!strcmp(pname, "ServerURL")) {
+      serverURL = String(val.val.s);
+      prefs.begin(NVS_NS_CONFIG, false);
+      prefs.putString(NVS_KEY_URL, serverURL);
+      prefs.end();
+      param->updateAndReport(val);
+      Serial.printf("[CONFIG] ServerURL updated: %s\n", serverURL.c_str());
+      return;
+    }
+    if (!strcmp(pname, "APIKey")) {
+      apiKey = String(val.val.s);
+      prefs.begin(NVS_NS_CONFIG, false);
+      prefs.putString(NVS_KEY_API, apiKey);
+      prefs.end();
+      param->updateAndReport(val);
+      Serial.printf("[CONFIG] APIKey updated: %s\n", apiKey.c_str());
+      return;
+    }
+  }
 
   // Add / Remove mode
   if (!strcmp(pname, P_ADD_MODE)) {
@@ -547,7 +567,14 @@ void setup() {
   SPI.begin();
   mfrc522.PCD_Init();
 
+  // Load kartu NVS
   loadCardsFromNVS();
+
+  // Load config server dari NVS (jika ada)
+  prefs.begin(NVS_NS_CONFIG, true);
+  serverURL = prefs.getString(NVS_KEY_URL, serverURL); // default jika belum ada
+  apiKey    = prefs.getString(NVS_KEY_API, apiKey);
+  prefs.end();
 
   my_node = RMaker.initNode("ESP32_RFID_Controller");
 
@@ -590,6 +617,20 @@ void setup() {
   relay_dev.addCb(write_callback);
   my_node.addDevice(relay_dev);
 
+  // === NEW Device: Config_Server ===
+  {
+    Param pUrl("ServerURL", NULL, value((char*)serverURL.c_str()), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+    pUrl.addUIType(ESP_RMAKER_UI_TEXT);
+    config_dev.addParam(pUrl);
+
+    Param pKey("APIKey", NULL, value((char*)apiKey.c_str()), PROP_FLAG_READ | PROP_FLAG_WRITE | PROP_FLAG_PERSIST);
+    pKey.addUIType(ESP_RMAKER_UI_TEXT);
+    config_dev.addParam(pKey);
+
+    config_dev.addCb(write_callback);
+    my_node.addDevice(config_dev);
+  }
+
   RMaker.enableOTA(OTA_USING_PARAMS);
   RMaker.setTimeZone("Asia/Jakarta");
   RMaker.enableSchedule();
@@ -604,6 +645,8 @@ void setup() {
 #endif
 
   updateListCardsParam();
+
+  Serial.println("[SETUP] Ready.");
 }
 
 // =================== Loop ===================
@@ -673,3 +716,4 @@ void loop() {
 
   delay(10);
 }
+
